@@ -6,6 +6,8 @@ const path = require('path');
 const fetch = require('node-fetch');
 const { MongoClient, ObjectId } = require('mongodb');
 const crypto = require('crypto');
+const Razorpay = require('razorpay');
+
 const ENCRYPTION_KEY = 'pypyabcd'; // 8 chars for DES, 16/24/32 for AES
 const IV = '1234567890123456'; // 16 chars for AES
 
@@ -48,6 +50,18 @@ mongoClient.connect()
 
 app.use(cors());
 app.use(bodyParser.json());
+
+// Log all incoming requests for debugging
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+  next();
+});
+
+// Initialize Razorpay SDK
+const razorpay = new Razorpay({
+  key_id: process.env.RAZORPAY_KEY_ID,
+  key_secret: process.env.RAZORPAY_KEY_SECRET,
+});
 
 // Example function to save customer data
 async function saveCustomerData(customer) {
@@ -374,6 +388,38 @@ app.post('/api/admin-update-shipping', async (req, res) => {
   }
 });
 
+// API endpoint to create a Razorpay order
+app.post('/api/create-razorpay-order', async (req, res) => {
+  const { amount, currency = 'INR', receipt } = req.body;
+  console.log('Received create-razorpay-order request:', req.body); // Debug log
+  if (!amount) {
+    console.log('Amount missing in request');
+    return res.status(400).json({ success: false, error: 'Amount is required' });
+  }
+  try {
+    const options = {
+      amount: Math.round(amount), // amount in paise
+      currency,
+      receipt: receipt || `rcpt_${Date.now()}`,
+    };
+    const order = await razorpay.orders.create(options);
+    console.log('Razorpay order created:', order); // Debug log
+    res.json({ success: true, order });
+  } catch (err) {
+    console.error('Razorpay order creation error:', err, err && err.error && err.error.description);
+    res.status(500).json({ success: false, error: 'Failed to create Razorpay order', details: err && err.error && err.error.description });
+  }
+});
+
+// Endpoint to provide Razorpay public key to frontend
+app.get('/api/get-razorpay-key', (req, res) => {
+  if (process.env.RAZORPAY_KEY_ID) {
+    res.json({ success: true, key: process.env.RAZORPAY_KEY_ID });
+  } else {
+    res.status(500).json({ success: false, message: 'Razorpay key not configured' });
+  }
+});
+
 // TEMPORARY: Clear all orders and attempted_orders collections (for development only)
 // Requires a secret token in the request header: x-clear-db-token (encrypted)
 app.post('/api/clear-db', async (req, res) => {
@@ -399,6 +445,12 @@ app.post('/api/clear-db', async (req, res) => {
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
+});
+
+// Test POST endpoint to verify POST proxying and backend connectivity
+app.post('/api/test-post', (req, res) => {
+  console.log('Received test POST:', req.body);
+  res.json({ success: true, message: 'POST works', body: req.body });
 });
 
 // Catch-all for unhandled API routes: always return JSON, not HTML
