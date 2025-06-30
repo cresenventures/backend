@@ -4,7 +4,24 @@ const cors = require('cors');
 const bodyParser = require('body-parser');
 const path = require('path');
 const fetch = require('node-fetch');
-const { MongoClient } = require('mongodb');
+const { MongoClient, ObjectId } = require('mongodb');
+const crypto = require('crypto');
+const ENCRYPTION_KEY = 'pypyabcd'; // 8 chars for DES, 16/24/32 for AES
+const IV = '1234567890123456'; // 16 chars for AES
+
+function encrypt(text) {
+  const cipher = crypto.createCipheriv('aes-128-cbc', ENCRYPTION_KEY, IV);
+  let encrypted = cipher.update(text, 'utf8', 'hex');
+  encrypted += cipher.final('hex');
+  return encrypted;
+}
+
+function decrypt(encrypted) {
+  const decipher = crypto.createDecipheriv('aes-128-cbc', ENCRYPTION_KEY, IV);
+  let decrypted = decipher.update(encrypted, 'hex', 'utf8');
+  decrypted += decipher.final('utf8');
+  return decrypted;
+}
 
 // Make sure you have a .env file in backend/ with:
 // MONGODB_URI=mongodb+srv://<username>:<password>@cluster0.xxxxx.mongodb.net/<dbname>?retryWrites=true&w=majority
@@ -47,22 +64,14 @@ app.post('/api/google-login', async (req, res) => {
   try {
     if (!mongoDb) return res.status(500).json({ error: 'DB not connected' });
     const collection = mongoDb.collection('users');
-    // Upsert user with role 'customer'
-    const update = {
-      $setOnInsert: { createdAt: new Date() },
-      $set: { email, role: 'customer', updatedAt: new Date() }
-    };
-    const result = await collection.findOneAndUpdate(
-      { email },
-      update,
-      { upsert: true, returnDocument: 'after' }
-    );
-    if (result.lastErrorObject && result.lastErrorObject.updatedExisting) {
-      console.log('User updated:', result.value);
-    } else {
-      console.log('User created:', result.value);
+    // Case-insensitive email match
+    let user = await collection.findOne({ email: { $regex: `^${email}$`, $options: 'i' } });
+    if (!user) {
+      // If user does not exist, create as customer by default
+      const insertResult = await collection.insertOne({ email, role: 'customer', createdAt: new Date(), updatedAt: new Date() });
+      user = await collection.findOne({ _id: insertResult.insertedId });
     }
-    res.json({ success: true, user: result.value });
+    res.json({ success: true, user });
   } catch (err) {
     console.error('Google login DB error:', err);
     res.status(500).json({ error: 'DB error' });
@@ -168,6 +177,238 @@ app.post('/api/calculate-shipping', async (req, res) => {
   } catch (err) {
     res.status(500).json({ error: 'Failed to calculate shipping fee' });
   }
+});
+
+// Save attempted order to database
+app.post('/api/save-attempted-order', async (req, res) => {
+  let { name, email, phone, items, shippingAddress, shippingFee } = req.body;
+  if (!name || !email || !phone || !items || !shippingAddress) {
+    return res.status(400).json({ success: false, error: 'Missing required fields' });
+  }
+  try {
+    if (!mongoDb) return res.status(500).json({ success: false, error: 'DB not connected' });
+    // Ensure shippingAddress contains name and phone
+    shippingAddress = {
+      ...shippingAddress,
+      name: shippingAddress.name || name,
+      phone: shippingAddress.phone || phone,
+    };
+    const collection = mongoDb.collection('attempted_orders');
+    const doc = {
+      name,
+      email,
+      phone,
+      items,
+      shippingAddress, // Always save shipping details
+      shippingFee,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+    // Upsert: update if exists, else insert (one attempted order per email)
+    const existing = await collection.findOne({ email });
+    if (existing) {
+      await collection.updateOne(
+        { email },
+        {
+          $set: {
+            name,
+            phone,
+            items,
+            shippingAddress,
+            shippingFee,
+            updatedAt: new Date(),
+          }
+        }
+      );
+    } else {
+      await collection.insertOne(doc);
+    }
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Save attempted order error:', err);
+    res.status(500).json({ success: false, error: 'DB error' });
+  }
+});
+
+// Save paid order to database
+app.post('/api/save-order', async (req, res) => {
+  console.log('Received order:', req.body); // Debug log
+  const { name, email, phone, items, shippingAddress, shippingFee, paymentId } = req.body;
+  if (!name || !email || !phone || !items || !shippingAddress || !paymentId) {
+    return res.status(400).json({ success: false, message: 'Missing required fields' });
+  }
+  try {
+    if (!mongoDb) return res.status(500).json({ success: false, message: 'DB not connected' });
+    const collection = mongoDb.collection('orders');
+    const doc = {
+      name,
+      email,
+      phone,
+      items,
+      shippingAddress,
+      shippingFee,
+      paymentId,
+      status: 'placed',
+      createdAt: new Date()
+    };
+    await collection.insertOne(doc);
+    // Remove attempted order for this user and items
+    const attemptedCollection = mongoDb.collection('attempted_orders');
+    await attemptedCollection.deleteMany({ email, 'items.title': { $in: items.map(i => i.title) } });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Save order DB error:', err);
+    res.status(500).json({ success: false, message: 'DB error' });
+  }
+});
+
+// Copy attempted order to orders with status 'preparing' (no paymentId required)
+app.post('/api/confirm-order', async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ success: false, message: 'Email required' });
+  try {
+    if (!mongoDb) return res.status(500).json({ success: false, message: 'DB not connected' });
+    const attemptedCollection = mongoDb.collection('attempted_orders');
+    const orderCollection = mongoDb.collection('orders');
+    const attempted = await attemptedCollection.findOne({ email });
+    if (!attempted) return res.status(404).json({ success: false, message: 'No attempted order found' });
+    // Copy all fields except _id
+    const { _id, ...orderData } = attempted;
+    orderData.status = 'preparing';
+    orderData.createdAt = new Date();
+    await orderCollection.insertOne(orderData);
+    // Optionally, remove attempted order after copying
+    await attemptedCollection.deleteOne({ email });
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Confirm order error:', err);
+    res.status(500).json({ success: false, message: 'DB error' });
+  }
+});
+
+// Get latest attempted order for a user (GET)
+app.get('/api/get-latest-attempted-order', async (req, res) => {
+  const email = req.query.email;
+  if (!email) return res.status(400).json({ success: false, error: 'Email is required' });
+  try {
+    if (!mongoDb) return res.status(500).json({ success: false, error: 'DB not connected' });
+    const collection = mongoDb.collection('attempted_orders');
+    // Find the latest attempted order for the user, sorted by creation date
+    const order = await collection.find({ email }).sort({ createdAt: -1 }).limit(1).toArray();
+    if (!order.length) return res.status(404).json({ success: false, error: 'No attempted order found' });
+    res.json({ success: true, order: order[0] });
+  } catch (err) {
+    console.error('Get latest attempted order error:', err);
+    res.status(500).json({ success: false, error: 'DB error' });
+  }
+});
+
+// Get all paid orders for a user (GET)
+app.get('/api/get-orders', async (req, res) => {
+  const email = req.query.email;
+  if (!email) return res.status(400).json({ success: false, error: 'Email is required' });
+  try {
+    if (!mongoDb) return res.status(500).json({ success: false, error: 'DB not connected' });
+    const collection = mongoDb.collection('orders');
+    // Find all paid orders for the user, sorted by creation date (latest first)
+    const orders = await collection.find({ email }).sort({ createdAt: -1 }).toArray();
+    res.json({ success: true, orders });
+  } catch (err) {
+    console.error('Get orders error:', err);
+    res.status(500).json({ success: false, error: 'DB error' });
+  }
+});
+
+// Admin: Get all orders for admin panel
+app.get('/api/admin-orders', async (req, res) => {
+  const tab = req.query.tab;
+  console.log(`[ADMIN ORDERS] Request received. Tab: ${tab}`); // Log incoming request
+  if (!mongoDb) return res.status(500).json({ success: false, error: 'DB not connected' });
+  try {
+    if (tab === 'attempted') {
+      // Return all attempted orders
+      const attemptedOrders = await mongoDb.collection('attempted_orders').find({}).sort({ createdAt: -1 }).toArray();
+      console.log(`[ADMIN ORDERS] Attempted orders count: ${attemptedOrders.length}`);
+      return res.json({ success: true, orders: attemptedOrders });
+    } else {
+      // For 'new' and 'dispatched', return from orders collection, filter by status if needed
+      let status = undefined;
+      if (tab === 'new') status = 'preparing';
+      if (tab === 'dispatched') status = 'dispatched';
+      const query = status ? { status } : {};
+      const orders = await mongoDb.collection('orders').find(query).sort({ createdAt: -1 }).toArray();
+      console.log(`[ADMIN ORDERS] Orders count for status '${status}': ${orders.length}`);
+      return res.json({ success: true, orders });
+    }
+  } catch (err) {
+    console.error('Admin orders error:', err);
+    res.status(500).json({ success: false, error: 'DB error' });
+  }
+});
+
+// Admin: Update shipping code and status for an order
+app.post('/api/admin-update-shipping', async (req, res) => {
+  const { orderId, shippingCode } = req.body;
+  if (!orderId || !shippingCode) {
+    return res.status(400).json({ success: false, error: 'orderId and shippingCode are required' });
+  }
+  // Validate orderId format
+  if (typeof orderId !== 'string' || !/^[a-fA-F0-9]{24}$/.test(orderId)) {
+    return res.status(400).json({ success: false, error: 'Invalid orderId format' });
+  }
+  try {
+    if (!mongoDb) return res.status(500).json({ success: false, error: 'DB not connected' });
+    const orders = mongoDb.collection('orders');
+    const order = await orders.findOne({ _id: new ObjectId(orderId) });
+    if (!order) return res.status(404).json({ success: false, error: 'Order not found' });
+    const update = { shippingCode };
+    if (order.status !== 'dispatched') update.status = 'dispatched';
+    await orders.updateOne(
+      { _id: new ObjectId(orderId) },
+      { $set: update }
+    );
+    res.json({ success: true });
+  } catch (err) {
+    console.error('Admin update shipping error:', err);
+    res.status(500).json({ success: false, error: 'DB error' });
+  }
+});
+
+// TEMPORARY: Clear all orders and attempted_orders collections (for development only)
+// Requires a secret token in the request header: x-clear-db-token (encrypted)
+app.post('/api/clear-db', async (req, res) => {
+  const AUTH_TOKEN = 'pypyabcd';
+  const clientTokenEncrypted = req.headers['x-clear-db-token'];
+  if (!clientTokenEncrypted) {
+    return res.status(401).json({ success: false, error: 'No token provided' });
+  }
+  let clientToken;
+  try {
+    clientToken = decrypt(clientTokenEncrypted);
+  } catch (e) {
+    return res.status(401).json({ success: false, error: 'Invalid token (decrypt failed)' });
+  }
+  if (clientToken !== AUTH_TOKEN) {
+    return res.status(401).json({ success: false, error: 'Unauthorized' });
+  }
+  if (!mongoDb) return res.status(500).json({ success: false, error: 'DB not connected' });
+  try {
+    await mongoDb.collection('attempted_orders').deleteMany({});
+    await mongoDb.collection('orders').deleteMany({});
+    res.json({ success: true, message: 'Database cleared' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Catch-all for unhandled API routes: always return JSON, not HTML
+app.use('/api', (req, res) => {
+  res.status(404).json({ success: false, error: 'API endpoint not found' });
+});
+
+// Catch-all for all other routes (frontend)
+app.use((req, res) => {
+  res.status(404).send('Not found');
 });
 
 app.listen(PORT, () => {
