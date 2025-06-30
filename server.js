@@ -48,7 +48,11 @@ mongoClient.connect()
     console.error('Failed to connect to MongoDB:', err);
   });
 
-app.use(cors());
+// Allow CORS only from your frontend domain
+app.use(cors({
+  origin: 'https://cresenthermalpaperrolls.com',
+  credentials: true,
+}));
 app.use(bodyParser.json());
 
 // Log all incoming requests for debugging
