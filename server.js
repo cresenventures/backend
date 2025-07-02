@@ -127,6 +127,11 @@ app.post('/api/get-cart', async (req, res) => {
   try {
     if (!mongoDb) return res.status(500).json({ error: 'DB not connected' });
     const collection = mongoDb.collection('cart');
+    // Remove all cart items for this user if a clear flag is sent
+    if (req.body.clear === true) {
+      await collection.deleteMany({ email });
+      return res.json({ success: true, cart: [] });
+    }
     const doc = await collection.findOne({ email });
     res.json({ success: true, cart: doc ? doc.cart : [] });
   } catch (err) {
@@ -446,6 +451,25 @@ app.post('/api/clear-db', async (req, res) => {
     await mongoDb.collection('attempted_orders').deleteMany({});
     await mongoDb.collection('orders').deleteMany({});
     res.json({ success: true, message: 'Database cleared' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ADMIN: Clear all collections with a passphrase (no encryption, for emergency use only)
+app.post('/api/clear-db-plain', async (req, res) => {
+  const { pass } = req.body;
+  if (pass !== 'YOUR_SECRET_PASS') {
+    return res.status(401).json({ success: false, error: 'Unauthorized' });
+  }
+  if (!mongoDb) return res.status(500).json({ success: false, error: 'DB not connected' });
+  try {
+    await mongoDb.collection('attempted_orders').deleteMany({});
+    await mongoDb.collection('orders').deleteMany({});
+    await mongoDb.collection('cart').deleteMany({});
+    await mongoDb.collection('customers').deleteMany({});
+    await mongoDb.collection('users').deleteMany({});
+    res.json({ success: true, message: 'All collections cleared' });
   } catch (err) {
     res.status(500).json({ success: false, error: err.message });
   }
